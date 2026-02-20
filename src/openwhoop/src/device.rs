@@ -101,9 +101,9 @@ impl WhoopDevice {
 
     pub async fn sync_history(&mut self, should_exit: Arc<AtomicBool>) -> anyhow::Result<()> {
         let mut notifications = self.peripheral.notifications().await?;
-        // self.send_command(WhoopPacket::toggle_r7_data_collection())
-        //     .await?;
-        self.send_command(WhoopPacket::history_start()).await?;
+        let start_time = (chrono::Utc::now().timestamp() - 48 * 3600) as u32;
+
+        self.send_command(WhoopPacket::history_start(Some(start_time))).await?;
 
         'a: loop {
             if should_exit.load(Ordering::SeqCst) {
@@ -119,7 +119,7 @@ impl WhoopDevice {
                         for _ in 0..5{
                             if self.connect().await.is_ok() {
                                 self.initialize().await?;
-                                self.send_command(WhoopPacket::history_start()).await?;
+                                self.send_command(WhoopPacket::history_start(Some(start_time))).await?;
                                 continue 'a;
                             }
 

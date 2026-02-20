@@ -60,10 +60,12 @@ impl OpenWhoop {
                             .create_reading(unix, bpm, rr, activity as i64)
                             .await?;
                     }
-                    WhoopData::HistoryMetadata { data, cmd, .. } => match cmd {
+                    WhoopData::HistoryMetadata { data, temperature, cmd, unix } => match cmd {
                         MetadataType::HistoryComplete => return Ok(None),
                         MetadataType::HistoryStart => {}
                         MetadataType::HistoryEnd => {
+                            info!("History sync ended. Temperature: {:.2}°C", temperature);
+                            self.database.update_temperature(unix, temperature as f64).await?;
                             let packet = WhoopPacket::history_end(data);
                             return Ok(Some(packet));
                         }

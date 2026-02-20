@@ -24,12 +24,21 @@ impl WhoopPacket {
         )
     }
 
-    pub fn history_start() -> WhoopPacket {
+    pub fn history_start(start_timestamp: Option<u32>) -> WhoopPacket {
+        let payload = match start_timestamp {
+            Some(ts) => {
+                let mut p = vec![0x01];
+                p.extend_from_slice(&ts.to_le_bytes());
+                p
+            }
+            None => vec![0x00],
+        };
+
         WhoopPacket::new(
             PacketType::Command,
             0,
             CommandNumber::SendHistoricalData.as_u8(),
-            vec![0x00],
+            payload,
         )
     }
 

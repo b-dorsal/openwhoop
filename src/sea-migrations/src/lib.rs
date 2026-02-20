@@ -7,6 +7,7 @@ pub mod m20250127_195808_sleep_cycles;
 mod m20250202_085524_activities;
 mod m20250214_202918_alter_heart_rate_stress;
 mod m20250402_092421_alter_sleep;
+pub mod m20260219_100000_add_temperature_to_heart_rate;
 
 pub struct Migrator;
 
@@ -21,6 +22,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20250202_085524_activities::Migration),
             Box::new(m20250214_202918_alter_heart_rate_stress::Migration),
             Box::new(m20250402_092421_alter_sleep::Migration),
+            Box::new(m20260219_100000_add_temperature_to_heart_rate::Migration),
         ]
     }
 }

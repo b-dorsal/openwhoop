@@ -15,6 +15,8 @@ pub struct Model {
     pub activity: Option<i64>,
     #[sea_orm(column_type = "Double", nullable)]
     pub stress: Option<f64>,
+    #[sea_orm(column_type = "Double", nullable)]
+    pub temperature: Option<f64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

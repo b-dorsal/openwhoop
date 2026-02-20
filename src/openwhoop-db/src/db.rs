@@ -61,6 +61,7 @@ impl DatabaseHandler {
             rr_intervals: Set(rr_to_string(rr)),
             activity: Set(Some(activity)),
             stress: NotSet,
+            temperature: NotSet,
         };
 
         let _model = db_entities::heart_rate::Entity::insert(packet)
@@ -73,6 +74,25 @@ impl DatabaseHandler {
             )
             .exec(&self.db)
             .await?;
+
+        Ok(())
+    }
+
+    pub async fn update_temperature(&self, unix: u32, temperature: f64) -> anyhow::Result<()> {
+        let time = timestamp_to_local(unix);
+        
+        // Find the most recent reading at or before the sync time
+        let latest_reading = db_entities::heart_rate::Entity::find()
+            .filter(db_entities::heart_rate::Column::Time.lte(time))
+            .order_by_desc(db_entities::heart_rate::Column::Time)
+            .one(&self.db)
+            .await?;
+
+        if let Some(reading) = latest_reading {
+            let mut active_model: db_entities::heart_rate::ActiveModel = reading.into();
+            active_model.temperature = Set(Some(temperature));
+            active_model.update(&self.db).await?;
+        }
 
         Ok(())
     }

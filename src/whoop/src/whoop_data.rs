@@ -7,11 +7,12 @@ use crate::{
 mod history;
 pub use history::{Activity, HistoryReading, ParsedHistoryReading};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum WhoopData {
     HistoryReading(HistoryReading),
     HistoryMetadata {
         unix: u32,
+        temperature: f32,
         data: u32,
         cmd: MetadataType,
     },
@@ -118,10 +119,14 @@ impl WhoopData {
             MetadataType::from_u8(packet.cmd).ok_or(WhoopError::InvalidMetadataType(packet.cmd))?;
 
         let unix = packet.data.read_u32_le()?;
-        let _padding = packet.data.read::<6>()?;
+        let temp_bytes = packet.data.read::<6>()?;
+        let mut temp_u64_bytes = [0u8; 8];
+        temp_u64_bytes[..6].copy_from_slice(&temp_bytes);
+        let temp_raw = u64::from_le_bytes(temp_u64_bytes);
+        let temperature = temp_raw as f32 / 100000.0;
         let data = packet.data.read_u32_le()?;
 
-        Ok(Self::HistoryMetadata { unix, data, cmd })
+        Ok(Self::HistoryMetadata { unix, temperature, data, cmd })
     }
 
     fn parse_historical_packet(mut packet: Vec<u8>) -> Result<Self, WhoopError> {
@@ -231,6 +236,7 @@ mod tests {
             data,
             WhoopData::HistoryMetadata {
                 unix: 1735831144,
+                temperature: 32.88432_f32,
                 data: 46791,
                 cmd: MetadataType::HistoryEnd
             }
@@ -282,6 +288,7 @@ mod tests {
             data,
             WhoopData::HistoryMetadata {
                 unix: 1736703145,
+                temperature: 36.2576_f32,
                 data: 32293,
                 cmd: MetadataType::HistoryEnd
             }
@@ -294,6 +301,7 @@ mod tests {
             data,
             WhoopData::HistoryMetadata {
                 unix: 1736702790,
+                temperature: 4.12736_f32,
                 data: 16,
                 cmd: MetadataType::HistoryStart,
             }
