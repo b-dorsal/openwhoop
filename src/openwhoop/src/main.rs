@@ -40,7 +40,7 @@ pub type DeviceId = String;
 pub struct OpenWhoopCli {
     #[arg(env, long)]
     pub debug_packets: bool,
-    #[arg(env, long)]
+    #[arg(env, long, default_value = "sqlite://openwhoop.db")]
     pub database_url: String,
     #[cfg(target_os = "linux")]
     #[arg(env, long)]
@@ -56,33 +56,9 @@ pub enum OpenWhoopCommand {
     ///
     Scan,
     ///
-    /// Download history data from whoop devices
+    /// Process all user data (events, stats, stress) and save to Firestore
     ///
-    DownloadHistory {
-        #[arg(long, env)]
-        whoop: DeviceId,
-    },
-    ///
-    /// Reruns the packet processing on stored packets
-    /// This is used after new more of packets get handled
-    ///
-    ReRun,
-    ///
-    /// Detects sleeps and exercises
-    ///
-    DetectEvents,
-    ///
-    /// Print sleep statistics for all time and last week
-    ///
-    SleepStats,
-    ///
-    /// Print activity statistics for all time and last week
-    ///
-    ExerciseStats,
-    ///
-    /// Calculate stress for historical data
-    ///
-    CalculateStress,
+    ProcessUser { user_id: String },
     ///
     /// Set alarm
     ///
@@ -126,6 +102,77 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = OpenWhoopCli::parse();
 
+    match cli.subcommand {
+        OpenWhoopCommand::ProcessUser { user_id } => {
+            let lookback_hours = std::env::var("LOOKBACK_HOURS")
+                .unwrap_or_else(|_| "168".to_string())
+                .parse::<u32>()
+                .unwrap_or(168);
+
+            info!("Processing data for user {} with lookback of {} hours", user_id, lookback_hours);
+            let mut all_readings = fetch_user_history(&user_id, lookback_hours).await?;
+
+            if all_readings.is_empty() {
+                println!("No data found for user {}", user_id);
+                return Ok(());
+            }
+
+            let events = openwhoop_algos::ActivityPeriod::detect(&mut all_readings);
+            let mut sleeps = Vec::new();
+            let mut exercises = Vec::new();
+
+            for event in events {
+                match event.activity {
+                    whoop::Activity::Sleep => {
+                        let cycle = openwhoop_algos::SleepCycle::from_event(event, &all_readings);
+                        sleeps.push(cycle);
+                    }
+                    whoop::Activity::Active => {
+                        exercises.push(event);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Calculate consistency metrics (optional printing for logs)
+            let sleep_analyzer = SleepConsistencyAnalyzer::new(sleeps.clone());
+            let sleep_metrics = sleep_analyzer.calculate_consistency_metrics();
+            println!("Sleep Metrics:\n{}", sleep_metrics);
+
+            let exercise_metrics = ExerciseMetrics::new(exercises.clone());
+            println!("Exercise Metrics:\n{}", exercise_metrics);
+
+            // Calculate stress for only the last 12 hours
+            let twelve_hours_ago = chrono::Utc::now().naive_utc() - chrono::TimeDelta::hours(12);
+            let recent_readings: Vec<_> = all_readings
+                .iter()
+                .filter(|r| r.time >= twelve_hours_ago)
+                .cloned()
+                .collect();
+
+            let stress_score = openwhoop_algos::StressCalculator::calculate_stress(&recent_readings);
+            if let Some(stress) = &stress_score {
+                println!("Calculated Stress Score: {}", stress.score);
+            } else {
+                println!("Not enough recent data to calculate stress score");
+            }
+
+            println!("Saving User Data to Firestore...");
+            let last_processed = all_readings.last().map(|r| r.time).unwrap_or_default();
+            write_firestore_events(&user_id, &sleeps, &exercises, stress_score, last_processed).await?;
+            println!("Successfully processed user {}", user_id);
+
+            return Ok(());
+        }
+        OpenWhoopCommand::Completions { shell } => {
+            let mut command = OpenWhoopCli::command();
+            let bin_name = command.get_name().to_string();
+            clap_complete::generate(shell, &mut command, bin_name, &mut std::io::stdout());
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let adapter = cli.create_ble_adapter().await?;
     let db_handler = DatabaseHandler::new(cli.database_url).await;
 
@@ -134,127 +181,8 @@ async fn main() -> anyhow::Result<()> {
             scan_command(&adapter, None).await?;
             Ok(())
         }
-        OpenWhoopCommand::DownloadHistory { whoop } => {
-            let peripheral = scan_command(&adapter, Some(whoop)).await?;
-            let mut whoop = WhoopDevice::new(peripheral, adapter, db_handler, cli.debug_packets);
 
-            let should_exit = Arc::new(AtomicBool::new(false));
 
-            let se = should_exit.clone();
-            ctrlc::set_handler(move || {
-                println!("Received CTRL+C!");
-                se.store(true, Ordering::SeqCst);
-            })?;
-
-            whoop.connect().await?;
-            whoop.initialize().await?;
-
-            let result = whoop.sync_history(should_exit).await;
-
-            info!("Exiting...");
-            if let Err(e) = result {
-                error!("{}", e);
-            }
-
-            loop {
-                if let Ok(true) = whoop.is_connected().await {
-                    whoop
-                        .send_command(WhoopPacket::exit_high_freq_sync())
-                        .await?;
-                    break;
-                } else {
-                    whoop.connect().await?;
-                    sleep(Duration::from_secs(1)).await;
-                }
-            }
-
-            Ok(())
-        }
-        OpenWhoopCommand::ReRun => {
-            let whoop = OpenWhoop::new(db_handler.clone());
-            let mut id = 0;
-            loop {
-                let packets = db_handler.get_packets(id).await?;
-                if packets.is_empty() {
-                    break;
-                }
-
-                for packet in packets {
-                    id = packet.id;
-                    whoop.handle_packet(packet).await?;
-                }
-
-                println!("{}", id);
-            }
-
-            Ok(())
-        }
-        OpenWhoopCommand::DetectEvents => {
-            let whoop = OpenWhoop::new(db_handler);
-            whoop.detect_sleeps().await?;
-            whoop.detect_events().await?;
-            Ok(())
-        }
-        OpenWhoopCommand::SleepStats => {
-            let whoop = OpenWhoop::new(db_handler);
-            let sleep_records = whoop.database.get_sleep_cycles().await?;
-
-            if sleep_records.is_empty() {
-                println!("No sleep records found, exiting now");
-                return Ok(());
-            }
-
-            let mut last_week = sleep_records
-                .iter()
-                .rev()
-                .take(7)
-                .copied()
-                .collect::<Vec<_>>();
-
-            last_week.reverse();
-            let analyzer = SleepConsistencyAnalyzer::new(sleep_records);
-            let metrics = analyzer.calculate_consistency_metrics();
-            println!("All time: \n{}", metrics);
-            let analyzer = SleepConsistencyAnalyzer::new(last_week);
-            let metrics = analyzer.calculate_consistency_metrics();
-            println!("\nWeek: \n{}", metrics);
-
-            Ok(())
-        }
-        OpenWhoopCommand::ExerciseStats => {
-            let whoop = OpenWhoop::new(db_handler);
-            let exercises = whoop
-                .database
-                .search_activities(
-                    SearchActivityPeriods::default().with_activity(ActivityType::Activity),
-                )
-                .await?;
-
-            if exercises.is_empty() {
-                println!("No activities found, exiting now");
-                return Ok(());
-            };
-
-            let last_week = exercises
-                .iter()
-                .rev()
-                .take(7)
-                .copied()
-                .rev()
-                .collect::<Vec<_>>();
-
-            let metrics = ExerciseMetrics::new(exercises);
-            let last_week = ExerciseMetrics::new(last_week);
-
-            println!("All time: \n{}", metrics);
-            println!("Last week: \n{}", last_week);
-            Ok(())
-        }
-        OpenWhoopCommand::CalculateStress => {
-            let whoop = OpenWhoop::new(db_handler);
-            whoop.calculate_stress().await?;
-            Ok(())
-        }
         OpenWhoopCommand::SetAlarm { whoop, alarm_time } => {
             let peripheral = scan_command(&adapter, Some(whoop)).await?;
             let mut whoop = WhoopDevice::new(peripheral, adapter, db_handler, cli.debug_packets);
@@ -318,13 +246,125 @@ async fn main() -> anyhow::Result<()> {
             whoop.get_version().await?;
             Ok(())
         }
-        OpenWhoopCommand::Completions { shell } => {
-            let mut command = OpenWhoopCli::command();
-            let bin_name = command.get_name().to_string();
-            generate(shell, &mut command, bin_name, &mut io::stdout());
-            Ok(())
+        _ => Ok(()), // Handled earlier
+    }
+}
+
+async fn fetch_user_history(user_id: &str, hours: u32) -> anyhow::Result<Vec<whoop::ParsedHistoryReading>> {
+    let project_id = std::env::var("GOOGLE_CLOUD_PROJECT").unwrap_or_else(|_| "your-project-id".to_string());
+    let dataset_id = std::env::var("BIGQUERY_DATASET").unwrap_or_else(|_| "whoop_data".to_string());
+
+    let bq_client = gcp_bigquery_client::Client::from_application_default_credentials()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to init BigQuery client: {}", e))?;
+
+    let query = format!(
+        "SELECT unix, bpm, rr, activity 
+         FROM `{project_id}.{dataset_id}.heart_rate` 
+         WHERE uid = '{user_id}' AND unix >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {hours} HOUR)
+         ORDER BY unix ASC"
+    );
+
+    let mut query_request = gcp_bigquery_client::model::query_request::QueryRequest::new(query);
+    query_request.use_legacy_sql = false;
+
+    let response = bq_client
+        .job()
+        .query(&project_id, query_request)
+        .await
+        .map_err(|e| anyhow::anyhow!("BigQuery query failed: {}", e))?;
+
+    let mut readings = Vec::new();
+    let mut rs = gcp_bigquery_client::model::query_response::ResultSet::new_from_query_response(response);
+    
+    while rs.next_row() {
+        if let (Ok(Some(time_str)), Ok(Some(bpm_i)), Ok(Some(rr_intervals)), Ok(Some(activity_i))) = (
+            rs.get_string(0),
+            rs.get_i64(1),
+            rs.get_string(2),
+            rs.get_i64(3),
+        ) {
+            let time = match chrono::DateTime::parse_from_rfc3339(&time_str) {
+                Ok(t) => t.naive_utc(),
+                Err(_) => {
+                    chrono::NaiveDateTime::parse_from_str(&time_str, "%Y-%m-%d %H:%M:%S UTC")
+                        .unwrap_or_default()
+                }
+            };
+
+            let hr = whoop::ParsedHistoryReading {
+                time,
+                bpm: bpm_i as u8,
+                rr: rr_intervals.split(',').filter_map(|s| s.parse().ok()).collect(),
+                activity: whoop::Activity::from(activity_i),
+            };
+            readings.push(hr);
         }
     }
+
+    info!("Fetched {} readings from BigQuery for user {}", readings.len(), user_id);
+    Ok(readings)
+}
+
+async fn write_firestore_events(
+    user_id: &str,
+    sleeps: &[openwhoop_algos::SleepCycle],
+    exercises: &[openwhoop_algos::ActivityPeriod],
+    stress_score: Option<openwhoop_algos::StressScore>,
+    last_processed: chrono::NaiveDateTime,
+
+) -> anyhow::Result<()> {
+    let project_id = std::env::var("GOOGLE_CLOUD_PROJECT").unwrap_or_else(|_| "your-project-id".to_string());
+    let users_col = std::env::var("FIRESTORE_COLLECTION_USERS").unwrap_or_else(|_| "users".to_string());
+
+    let firestore_db = firestore::FirestoreDb::new(&project_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to init Firestore client: {}", e))?;
+
+    let json_sleeps: Vec<_> = sleeps.iter().map(|sleep| serde_json::json!({
+        "sleep_id": sleep.start.and_utc().timestamp(),
+        "start": sleep.start.and_utc().timestamp(),
+        "end": sleep.end.and_utc().timestamp(),
+        "min_bpm": sleep.min_bpm,
+        "max_bpm": sleep.max_bpm,
+        "avg_bpm": sleep.avg_bpm as f64,
+        "min_hrv": sleep.min_hrv as f64,
+        "max_hrv": sleep.max_hrv as f64,
+        "avg_hrv": sleep.avg_hrv as f64,
+        "score": sleep.score,
+    })).collect();
+
+    let json_exercises: Vec<_> = exercises.iter().map(|exercise| serde_json::json!({
+        "period_id": exercise.start.and_utc().timestamp(),
+        "activity": exercise.activity as u8,
+        "start": exercise.start.and_utc().timestamp(),
+        "end": exercise.end.and_utc().timestamp(),
+    })).collect();
+
+    let mut doc = serde_json::json!({
+        "lastProcessedReading": last_processed.and_utc().timestamp(),
+        "sleep_cycles": json_sleeps,
+        "activities": json_exercises,
+    });
+
+    if let Some(stress) = stress_score {
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert("stress_score".to_string(), serde_json::json!({
+                "time": stress.time.and_utc().timestamp(),
+                "score": stress.score as f64,
+            }));
+        }
+    }
+
+    firestore_db.fluent()
+        .update()
+        .in_col(&users_col)
+        .document_id(user_id)
+        .object(&doc)
+        .execute::<()>()
+        .await?;
+
+    Ok(())
 }
 
 async fn scan_command(

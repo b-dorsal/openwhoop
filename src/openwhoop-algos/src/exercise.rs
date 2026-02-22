@@ -6,7 +6,7 @@ use crate::helpers::{
     format_hm::FormatHM,
     time_math::{mean_deltas, std_dev_delta},
 };
-use openwhoop_types::activities::ActivityPeriod;
+use crate::ActivityPeriod;
 
 #[derive(Debug, Default)]
 pub struct ExerciseMetrics {
@@ -25,7 +25,7 @@ impl ExerciseMetrics {
         let count = exercises.len().try_into().unwrap_or(u64::MAX);
         let durations = exercises
             .into_iter()
-            .map(|e| e.to - e.from)
+            .map(|e| e.end - e.start)
             .collect::<Vec<_>>();
 
         let mean_duration = mean_deltas(durations.as_slice());
