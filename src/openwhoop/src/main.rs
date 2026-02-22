@@ -268,37 +268,58 @@ async fn fetch_user_history(user_id: &str, hours: u32) -> anyhow::Result<Vec<who
     let mut query_request = gcp_bigquery_client::model::query_request::QueryRequest::new(query);
     query_request.use_legacy_sql = false;
 
-    let response = bq_client
+    let mut response = bq_client
         .job()
         .query(&project_id, query_request)
         .await
         .map_err(|e| anyhow::anyhow!("BigQuery query failed: {}", e))?;
 
     let mut readings = Vec::new();
-    let mut rs = gcp_bigquery_client::model::query_response::ResultSet::new_from_query_response(response);
-    
-    while rs.next_row() {
-        if let (Ok(Some(time_str)), Ok(Some(bpm_i)), Ok(Some(rr_intervals)), Ok(Some(activity_i))) = (
-            rs.get_string(0),
-            rs.get_i64(1),
-            rs.get_string(2),
-            rs.get_i64(3),
-        ) {
-            let time = match chrono::DateTime::parse_from_rfc3339(&time_str) {
-                Ok(t) => t.naive_utc(),
-                Err(_) => {
-                    chrono::NaiveDateTime::parse_from_str(&time_str, "%Y-%m-%d %H:%M:%S UTC")
-                        .unwrap_or_default()
-                }
-            };
 
-            let hr = whoop::ParsedHistoryReading {
-                time,
-                bpm: bpm_i as u8,
-                rr: rr_intervals.split(',').filter_map(|s| s.parse().ok()).collect(),
-                activity: whoop::Activity::from(activity_i),
-            };
-            readings.push(hr);
+    loop {
+        let mut rs = gcp_bigquery_client::model::query_response::ResultSet::new_from_query_response(response.clone());
+        
+        while rs.next_row() {
+            if let (Ok(Some(time_str)), Ok(Some(bpm_i)), Ok(Some(rr_intervals)), Ok(Some(activity_i))) = (
+                rs.get_string(0),
+                rs.get_i64(1),
+                rs.get_string(2),
+                rs.get_i64(3),
+            ) {
+                let time = match chrono::DateTime::parse_from_rfc3339(&time_str) {
+                    Ok(t) => t.naive_utc(),
+                    Err(_) => {
+                        chrono::NaiveDateTime::parse_from_str(&time_str, "%Y-%m-%d %H:%M:%S UTC")
+                            .unwrap_or_default()
+                    }
+                };
+
+                let hr = whoop::ParsedHistoryReading {
+                    time,
+                    bpm: bpm_i as u8,
+                    rr: rr_intervals.split(',').filter_map(|s| s.parse().ok()).collect(),
+                    activity: whoop::Activity::from(activity_i),
+                };
+                readings.push(hr);
+            }
+        }
+
+        if let Some(token) = response.page_token.clone() {
+            if let Some(job_ref) = response.job_reference.as_ref() {
+                let job_id = job_ref.job_id.as_ref().unwrap();
+                let mut options = gcp_bigquery_client::model::get_query_results_parameters::GetQueryResultsParameters::default();
+                options.page_token = Some(token);
+                options.location = job_ref.location.clone();
+                
+                let next_resp = bq_client.job().get_query_results(&project_id, job_id, options).await
+                    .map_err(|e| anyhow::anyhow!("BigQuery page fetch failed: {}", e))?;
+                
+                response = next_resp.into();
+            } else {
+                break;
+            }
+        } else {
+            break;
         }
     }
 
