@@ -112,16 +112,129 @@ async fn main() -> anyhow::Result<()> {
             info!("Processing data for user {} with lookback of {} hours", user_id, lookback_hours);
             let mut all_readings = fetch_user_history(&user_id, lookback_hours).await?;
 
+            // ── Check 1: Non-empty dataset ────────────────────────────────────────
             if all_readings.is_empty() {
-                println!("No data found for user {}", user_id);
-                return Ok(());
+                error!("No data found for user {} — cannot run detection", user_id);
+                return Err(anyhow!("No BigQuery rows returned for user {}", user_id));
+            }
+            info!("Check 1 PASS: {} total readings fetched", all_readings.len());
+
+            // ── Check 2: Time range sanity ────────────────────────────────────────
+            let min_time = all_readings.first().map(|r| r.time).unwrap();
+            let max_time = all_readings.last().map(|r| r.time).unwrap();
+            let span_hours = (max_time - min_time).num_hours();
+            info!("Check 2: Time range {} → {} (~{} hours)", min_time, max_time, span_hours);
+            if min_time.and_utc().timestamp() < chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z").unwrap().timestamp() {
+                return Err(anyhow!(
+                    "Earliest reading timestamp {} looks like an epoch/default value — \
+                     timestamp parsing likely broke during BigQuery fetch. Aborting.",
+                    min_time
+                ));
+            }
+            if span_hours < 1 {
+                warn!("Time span of {} hours is suspiciously short for a {}-hour lookback window", span_hours, lookback_hours);
+            } else {
+                info!("Check 2 PASS: time range looks reasonable");
             }
 
+            // ── Check 3: Chronological order ──────────────────────────────────────
+            {
+                let mut order_ok = true;
+                for window in all_readings.windows(2) {
+                    if window[1].time < window[0].time {
+                        error!(
+                            "Check 3 FAIL: readings are not sorted — found {} before {} at indices near the dataset",
+                            window[1].time, window[0].time
+                        );
+                        order_ok = false;
+                        break;
+                    }
+                }
+                if !order_ok {
+                    return Err(anyhow!(
+                        "BigQuery results are not in ascending time order. \
+                         The detection algorithm requires sorted data."
+                    ));
+                }
+                info!("Check 3 PASS: readings are in ascending time order");
+            }
+
+            // ── Check 4: Data density / gaps ──────────────────────────────────────
+            {
+                let total_gap_secs: i64 = all_readings
+                    .windows(2)
+                    .map(|w| (w[1].time - w[0].time).num_seconds())
+                    .sum();
+                let avg_gap_secs = total_gap_secs / (all_readings.len() as i64 - 1).max(1);
+                info!("Check 4: Average gap between readings: {}s", avg_gap_secs);
+                if avg_gap_secs > 300 {
+                    warn!(
+                        "Average gap of {}s (>{} min) is very high — data may be too sparse for accurate detection",
+                        avg_gap_secs, avg_gap_secs / 60
+                    );
+                }
+                // Report but do not abort on large individual gaps
+                let large_gaps: Vec<_> = all_readings
+                    .windows(2)
+                    .filter(|w| (w[1].time - w[0].time).num_minutes() > 60)
+                    .map(|w| (w[0].time, w[1].time, (w[1].time - w[0].time).num_minutes()))
+                    .collect();
+                if large_gaps.is_empty() {
+                    info!("Check 4 PASS: no gaps > 60 min found");
+                } else {
+                    warn!("Check 4: found {} gap(s) > 60 min in the data:", large_gaps.len());
+                    for (start, end, mins) in &large_gaps {
+                        warn!("  Gap: {} → {} ({} min)", start, end, mins);
+                    }
+                }
+            }
+
+            // ── Check 5: BPM sanity ───────────────────────────────────────────────
+            {
+                let min_bpm = all_readings.iter().map(|r| r.bpm).min().unwrap();
+                let max_bpm = all_readings.iter().map(|r| r.bpm).max().unwrap();
+                let mean_bpm = all_readings.iter().map(|r| r.bpm as u64).sum::<u64>() / all_readings.len() as u64;
+                info!("Check 5: BPM stats — min={} max={} mean={}", min_bpm, max_bpm, mean_bpm);
+                if mean_bpm < 20 || mean_bpm > 220 {
+                    return Err(anyhow!(
+                        "Mean BPM of {} is physiologically implausible — data is likely corrupted or column mapping is wrong",
+                        mean_bpm
+                    ));
+                }
+                info!("Check 5 PASS: BPM values look reasonable");
+            }
+
+            // ── Check 6: Activity distribution ────────────────────────────────────
+            {
+                let mut counts = std::collections::HashMap::new();
+                for r in &all_readings {
+                    *counts.entry(format!("{:?}", r.activity)).or_insert(0u64) += 1;
+                }
+                info!("Check 6: Activity distribution: {:?}", counts);
+                let unknown_count = counts.get("Unknown").copied().unwrap_or(0);
+                if unknown_count == all_readings.len() as u64 {
+                    return Err(anyhow!(
+                        "100% of readings ({}) have Unknown activity — the activity column \
+                         mapping is almost certainly broken (check BigQuery column name/type)",
+                        unknown_count
+                    ));
+                } else if unknown_count > 0 {
+                    warn!("{} readings ({:.1}%) have Unknown activity",
+                        unknown_count,
+                        unknown_count as f64 / all_readings.len() as f64 * 100.0
+                    );
+                } else {
+                    info!("Check 6 PASS: no Unknown-activity readings");
+                }
+            }
+
+            info!("All pre-detection checks passed — running event detection");
             let events = openwhoop_algos::ActivityPeriod::detect(&mut all_readings);
             let mut sleeps = Vec::new();
             let mut exercises = Vec::new();
 
             for event in events {
+                info!("EVENT: {:?} {} → {}", event.activity, event.start, event.end);
                 match event.activity {
                     whoop::Activity::Sleep => {
                         let cycle = openwhoop_algos::SleepCycle::from_event(event, &all_readings);
@@ -275,33 +388,110 @@ async fn fetch_user_history(user_id: &str, hours: u32) -> anyhow::Result<Vec<who
         .map_err(|e| anyhow::anyhow!("BigQuery query failed: {}", e))?;
 
     let mut readings = Vec::new();
+    let mut rows_scanned: u64 = 0;
+    let mut rows_skipped_parse: u64 = 0;
+    let mut rows_skipped_bpm: u64 = 0;
+    let mut rows_skipped_epoch: u64 = 0;
+    let epoch_cutoff = chrono::NaiveDateTime::parse_from_str("2020-01-01 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
 
     loop {
         let mut rs = gcp_bigquery_client::model::query_response::ResultSet::new_from_query_response(response.clone());
-        
-        while rs.next_row() {
-            if let (Ok(Some(time_str)), Ok(Some(bpm_i)), Ok(Some(rr_intervals)), Ok(Some(activity_i))) = (
-                rs.get_string(0),
-                rs.get_i64(1),
-                rs.get_string(2),
-                rs.get_i64(3),
-            ) {
-                let time = match chrono::DateTime::parse_from_rfc3339(&time_str) {
-                    Ok(t) => t.naive_utc(),
-                    Err(_) => {
-                        chrono::NaiveDateTime::parse_from_str(&time_str, "%Y-%m-%d %H:%M:%S UTC")
-                            .unwrap_or_default()
-                    }
-                };
 
-                let hr = whoop::ParsedHistoryReading {
-                    time,
-                    bpm: bpm_i as u8,
-                    rr: rr_intervals.split(',').filter_map(|s| s.parse().ok()).collect(),
-                    activity: whoop::Activity::from(activity_i),
-                };
-                readings.push(hr);
+        while rs.next_row() {
+            rows_scanned += 1;
+
+            // Unpack all four columns, logging any parse failures with raw values
+            let time_result = rs.get_string(0);
+            let bpm_result = rs.get_i64(1);
+            let rr_result = rs.get_string(2);
+            let activity_result = rs.get_i64(3);
+
+            let (time_str, bpm_i, rr_intervals, activity_i) = match (
+                time_result,
+                bpm_result,
+                rr_result,
+                activity_result,
+            ) {
+                (Ok(Some(t)), Ok(Some(b)), Ok(Some(r)), Ok(Some(a))) => (t, b, r, a),
+                (t, b, r, a) => {
+                    rows_skipped_parse += 1;
+                    warn!(
+                        "Row {}: failed to parse one or more columns — \
+                         unix={:?} bpm={:?} rr={:?} activity={:?}; skipping",
+                        rows_scanned, t, b, r, a
+                    );
+                    continue;
+                }
+            };
+
+            // Skip bpm=0 rows (band off, no reading) — expected, log at debug only.
+            // Reject bpm>250 as a corrupt/impossible value.
+            if bpm_i == 0 {
+                rows_skipped_bpm += 1;
+                debug!("Row {}: BPM=0 (band off), skipping", rows_scanned);
+                continue;
             }
+            if bpm_i > 250 {
+                rows_skipped_bpm += 1;
+                warn!(
+                    "Row {}: BPM value {} is above physiological maximum (250); skipping",
+                    rows_scanned, bpm_i
+                );
+                continue;
+            }
+
+            // Parse timestamp — try RFC 3339 first, then BigQuery's plain UTC format,
+            // then as a FLOAT64 unix seconds value (BigQuery returns these as scientific
+            // notation strings like "1.77169068E9").
+            let time = match chrono::DateTime::parse_from_rfc3339(&time_str) {
+                Ok(t) => t.naive_utc(),
+                Err(_) => match chrono::NaiveDateTime::parse_from_str(&time_str, "%Y-%m-%d %H:%M:%S UTC") {
+                    Ok(t) => t,
+                    Err(_) => match time_str.parse::<f64>() {
+                        Ok(unix_secs) => {
+                            let secs = unix_secs as i64;
+                            match chrono::DateTime::from_timestamp(secs, 0) {
+                                Some(dt) => dt.naive_utc(),
+                                None => {
+                                    rows_skipped_parse += 1;
+                                    warn!(
+                                        "Row {}: unix timestamp {} is out of valid range; skipping",
+                                        rows_scanned, secs
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            rows_skipped_parse += 1;
+                            warn!(
+                                "Row {}: could not parse timestamp {:?} — {}: skipping",
+                                rows_scanned, time_str, e
+                            );
+                            continue;
+                        }
+                    },
+                },
+            };
+
+            // Reject epoch/default timestamps (indicates parse produced a zero datetime)
+            if time < epoch_cutoff {
+                rows_skipped_epoch += 1;
+                warn!(
+                    "Row {}: timestamp {} predates 2020 — likely an epoch/default value from a \
+                     failed parse (raw string: {:?}); skipping",
+                    rows_scanned, time, time_str
+                );
+                continue;
+            }
+
+            let hr = whoop::ParsedHistoryReading {
+                time,
+                bpm: bpm_i as u8,
+                rr: rr_intervals.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
+                activity: whoop::Activity::from(activity_i),
+            };
+            readings.push(hr);
         }
 
         if let Some(token) = response.page_token.clone() {
@@ -310,10 +500,10 @@ async fn fetch_user_history(user_id: &str, hours: u32) -> anyhow::Result<Vec<who
                 let mut options = gcp_bigquery_client::model::get_query_results_parameters::GetQueryResultsParameters::default();
                 options.page_token = Some(token);
                 options.location = job_ref.location.clone();
-                
+
                 let next_resp = bq_client.job().get_query_results(&project_id, job_id, options).await
                     .map_err(|e| anyhow::anyhow!("BigQuery page fetch failed: {}", e))?;
-                
+
                 response = next_resp.into();
             } else {
                 break;
@@ -323,7 +513,23 @@ async fn fetch_user_history(user_id: &str, hours: u32) -> anyhow::Result<Vec<who
         }
     }
 
-    info!("Fetched {} readings from BigQuery for user {}", readings.len(), user_id);
+    info!(
+        "BigQuery fetch complete: scanned={} accepted={} skipped_parse={} skipped_bpm={} skipped_epoch={}",
+        rows_scanned,
+        readings.len(),
+        rows_skipped_parse,
+        rows_skipped_bpm,
+        rows_skipped_epoch,
+    );
+
+    if rows_skipped_parse > 0 || rows_skipped_epoch > 0 {
+        warn!(
+            "{} rows were skipped due to parsing errors — check BigQuery column names/types match \
+             the query (unix, bpm, rr, activity)",
+            rows_skipped_parse + rows_skipped_epoch
+        );
+    }
+
     Ok(readings)
 }
 
@@ -336,7 +542,7 @@ async fn write_firestore_events(
 
 ) -> anyhow::Result<()> {
     let project_id = std::env::var("GOOGLE_CLOUD_PROJECT").unwrap_or_else(|_| "your-project-id".to_string());
-    let users_col = std::env::var("FIRESTORE_COLLECTION_USERS").unwrap_or_else(|_| "users".to_string());
+    let users_col = std::env::var("FIRESTORE_COLLECTION_USERS").unwrap_or_else(|_| "user-data".to_string());
 
     let firestore_db = firestore::FirestoreDb::new(&project_id)
         .await
