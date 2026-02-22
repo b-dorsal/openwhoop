@@ -112,6 +112,26 @@ async fn main() -> anyhow::Result<()> {
             info!("Processing data for user {} with lookback of {} hours", user_id, lookback_hours);
             let mut all_readings = fetch_user_history(&user_id, lookback_hours).await?;
 
+            // ── Deduplication ─────────────────────────────────────────────────────
+            // BigQuery has no UNIQUE constraint on the timestamp column (unlike the
+            // old SQLite schema). Duplicate rows at the same timestamp with different
+            // activity labels cause smooth_spikes to erase entire Sleep/Active periods.
+            {
+                let before = all_readings.len();
+                let mut seen = std::collections::HashSet::new();
+                all_readings.retain(|r| seen.insert(r.time));
+                let dupes = before - all_readings.len();
+                if dupes > 0 {
+                    warn!(
+                        "Removed {} duplicate-timestamp rows (BigQuery lacks UNIQUE \
+                         constraint on unix) — this was causing Sleep/Active events to disappear",
+                        dupes
+                    );
+                } else {
+                    info!("Dedup: no duplicate timestamps found");
+                }
+            }
+
             // ── Check 1: Non-empty dataset ────────────────────────────────────────
             if all_readings.is_empty() {
                 error!("No data found for user {} — cannot run detection", user_id);
@@ -583,8 +603,30 @@ async fn write_firestore_events(
         }
     }
 
+    // Add the most recent sleep's HRV stats at the top level of the document
+    if let Some(latest_sleep) = sleeps.last() {
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert("latest_sleep_hrv".to_string(), serde_json::json!({
+                "min_hrv": latest_sleep.min_hrv as f64,
+                "max_hrv": latest_sleep.max_hrv as f64,
+                "avg_hrv": latest_sleep.avg_hrv as f64,
+                "sleep_start": latest_sleep.start.and_utc().timestamp(),
+                "sleep_end": latest_sleep.end.and_utc().timestamp(),
+            }));
+        }
+    }
+
+    // Collect the top-level keys being written so Firestore performs a partial
+    // update (update mask / PATCH semantics) and leaves all other existing
+    // fields on the document untouched.
+    let written_fields: Vec<String> = doc
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+
     firestore_db.fluent()
         .update()
+        .fields(written_fields.iter().map(|s| s.as_str()))
         .in_col(&users_col)
         .document_id(user_id)
         .object(&doc)
