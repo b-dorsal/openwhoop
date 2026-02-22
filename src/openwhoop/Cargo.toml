@@ -28,3 +28,5 @@ tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros"] }
 uuid = { version = "1.11.1", features = ["v4"] }
 whoop = { version = "0.1.0", path = "../whoop" }
 clap_complete = "4.5.50"
+gcp-bigquery-client = "0.28.0"
+firestore = "0.47.1"

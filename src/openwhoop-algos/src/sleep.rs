@@ -32,15 +32,21 @@ impl SleepCycle {
         let max_hrv = rolling_hrv.iter().max().copied().unwrap_or_default() as u16;
 
         let hrv_count = rolling_hrv.len() as u64;
-        let hrv = rolling_hrv.into_iter().sum::<u64>() / hrv_count;
-        let avg_hrv = hrv as u16;
+        let avg_hrv = if hrv_count == 0 {
+            0u16
+        } else {
+            (rolling_hrv.into_iter().sum::<u64>() / hrv_count) as u16
+        };
 
         let min_bpm = heart_rate.iter().min().copied().unwrap_or_default() as u8;
         let max_bpm = heart_rate.iter().max().copied().unwrap_or_default() as u8;
 
         let heart_rate_count = heart_rate.len() as u64;
-        let bpm = heart_rate.into_iter().sum::<u64>() / heart_rate_count;
-        let avg_bpm = bpm as u8;
+        let avg_bpm = if heart_rate_count == 0 {
+            0u8
+        } else {
+            (heart_rate.into_iter().sum::<u64>() / heart_rate_count) as u8
+        };
 
         let id = event.end.date();
 
