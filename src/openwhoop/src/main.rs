@@ -258,6 +258,11 @@ async fn main() -> anyhow::Result<()> {
                 match event.activity {
                     whoop::Activity::Sleep => {
                         let cycle = openwhoop_algos::SleepCycle::from_event(event, &all_readings);
+                        info!(
+                            "Sleep cycle HRV: min={} avg={} max={} (readings in window: {})",
+                            cycle.min_hrv, cycle.avg_hrv, cycle.max_hrv,
+                            all_readings.iter().filter(|r| r.time >= event.start && r.time <= event.end).count()
+                        );
                         sleeps.push(cycle);
                     }
                     whoop::Activity::Active => {
@@ -505,10 +510,24 @@ async fn fetch_user_history(user_id: &str, hours: u32) -> anyhow::Result<Vec<who
                 continue;
             }
 
+            // rr is stored as a JSON array string e.g. "[1440,1538]" or "[]"
+            let rr_parsed: Vec<u16> =
+                serde_json::from_str::<Vec<u16>>(&rr_intervals).unwrap_or_else(|_| {
+                    // Fallback: try plain comma-separated for any legacy rows
+                    rr_intervals
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect()
+                });
+
+            if !rr_parsed.is_empty() && readings.iter().all(|r: &whoop::ParsedHistoryReading| r.rr.is_empty()) {
+                debug!("RR sample (row {}): raw={:?} parsed={:?}", rows_scanned, rr_intervals, rr_parsed);
+            }
+
             let hr = whoop::ParsedHistoryReading {
                 time,
                 bpm: bpm_i as u8,
-                rr: rr_intervals.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
+                rr: rr_parsed,
                 activity: whoop::Activity::from(activity_i),
             };
             readings.push(hr);
@@ -533,14 +552,23 @@ async fn fetch_user_history(user_id: &str, hours: u32) -> anyhow::Result<Vec<who
         }
     }
 
+    let readings_with_rr = readings.iter().filter(|r| !r.rr.is_empty()).count();
     info!(
-        "BigQuery fetch complete: scanned={} accepted={} skipped_parse={} skipped_bpm={} skipped_epoch={}",
+        "BigQuery fetch complete: scanned={} accepted={} skipped_parse={} skipped_bpm={} skipped_epoch={} | \
+         readings_with_rr_data={} ({:.1}%)",
         rows_scanned,
         readings.len(),
         rows_skipped_parse,
         rows_skipped_bpm,
         rows_skipped_epoch,
+        readings_with_rr,
+        if readings.is_empty() { 0.0 } else { readings_with_rr as f64 / readings.len() as f64 * 100.0 },
     );
+
+    if readings_with_rr == 0 {
+        warn!("No RR interval data found in any row — HRV will be 0. \
+               Check that the 'rr' BigQuery column contains comma-separated u16 millisecond values.");
+    }
 
     if rows_skipped_parse > 0 || rows_skipped_epoch > 0 {
         warn!(
