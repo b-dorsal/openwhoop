@@ -241,7 +241,7 @@ impl OpenWhoop {
 
             let stress_scores = history
                 .windows(StressCalculator::MIN_READING_PERIOD)
-                .filter_map(StressCalculator::calculate_stress);
+                .filter_map(StressCalculator::calculate_stress_simple);
 
             for stress in stress_scores {
                 self.database.update_stress_on_reading(stress).await?;
@@ -263,6 +263,7 @@ fn map_sleep_cycle(sleep: db_entities::sleep_cycles::Model) -> SleepCycle {
         min_hrv: sleep.min_hrv.try_into().unwrap(),
         max_hrv: sleep.max_hrv.try_into().unwrap(),
         avg_hrv: sleep.avg_hrv.try_into().unwrap(),
+        avg_resp_rate: 0.0, // not stored in SQLite schema; computed only in BigQuery path
         score: sleep
             .score
             .unwrap_or_else(|| SleepCycle::sleep_score(sleep.start, sleep.end)),

@@ -1,143 +1,154 @@
 use chrono::NaiveDateTime;
-use std::collections::BTreeMap;
-use whoop::ParsedHistoryReading;
+use whoop::{Activity, ParsedHistoryReading};
 
 pub struct StressCalculator;
 
 #[derive(Debug, Clone, Copy)]
 pub struct StressScore {
     pub time: NaiveDateTime,
+    /// 0.0 (no stress / well-recovered) to 10.0 (high stress / fatigued)
     pub score: f64,
+    /// RMSSD of waking RR intervals in the last 4 hours (ms)
+    pub waking_rmssd: f64,
+    /// The sleep HRV baseline used for comparison, if available
+    pub baseline_hrv: Option<f64>,
 }
 
 impl StressCalculator {
-    pub const MIN_READING_PERIOD: usize = 120;
+    /// Minimum number of waking readings required to compute a score
+    pub const MIN_READINGS: usize = 60;
+    /// Alias kept for backward compatibility with the Bluetooth device code path
+    pub const MIN_READING_PERIOD: usize = Self::MIN_READINGS;
 
-    pub fn calculate_stress(hr: &[ParsedHistoryReading]) -> Option<StressScore> {
-        if hr.len() < Self::MIN_READING_PERIOD {
+    /// Single-argument convenience wrapper (no sleep baseline).
+    /// Used by the legacy Bluetooth/SQLite device flow in `openwhoop.rs`.
+    pub fn calculate_stress_simple(hr: &[ParsedHistoryReading]) -> Option<StressScore> {
+        Self::calculate_stress(hr, None)
+    }
+    /// How many hours of waking history to use
+    pub const WAKING_WINDOW_HOURS: i64 = 4;
+
+    /// Calculate a stress/recovery score from recent waking heart rate data.
+    ///
+    /// Algorithm:
+    /// 1. Filter to the last 4 hours, excluding Active periods (exercise
+    ///    elevates HR by design and should not be read as stress).
+    /// 2. Build an RR interval sequence: use actual device RR intervals where
+    ///    available, fall back to synthetic RR from BPM otherwise.
+    /// 3. Compute RMSSD over that sequence.
+    /// 4. If a sleep HRV baseline is provided, express the score as
+    ///    `(1 - waking_rmssd / baseline) * 10` — a ratio near 1.0 means the
+    ///    waking HRV matches sleep recovery levels (low stress), well below 1.0
+    ///    means the autonomic system is under strain.
+    ///    Without a baseline, fall back to an absolute RMSSD scale.
+    pub fn calculate_stress(
+        hr: &[ParsedHistoryReading],
+        sleep_baseline_hrv: Option<f64>,
+    ) -> Option<StressScore> {
+        if hr.is_empty() {
             return None;
         }
 
-        let time = hr.last()?.time;
-        let hr = hr.iter().map(|hr| hr.bpm).collect::<Vec<_>>();
-        let score = StressCalcParams::new(hr).stress_score();
-        Some(StressScore { time, score })
+        let latest_time = hr.last()?.time;
+        let window_start = latest_time - chrono::Duration::hours(Self::WAKING_WINDOW_HOURS);
+
+        // Filter to waking-rest readings in the last 4 hours (exclude Active/exercise)
+        let waking_readings: Vec<&ParsedHistoryReading> = hr
+            .iter()
+            .filter(|r| r.time >= window_start)
+            .filter(|r| !matches!(r.activity, Activity::Active))
+            .collect();
+
+        if waking_readings.len() < Self::MIN_READINGS {
+            return None;
+        }
+
+        // Build an RR sequence.  For readings that have actual device RR
+        // intervals, use them directly (multiple per reading is fine —
+        // they're individual beat-to-beat intervals).  For readings without
+        // RR data, synthesize one interval from BPM.
+        let rr_sequence: Vec<f64> = waking_readings
+            .iter()
+            .flat_map(|r| {
+                if !r.rr.is_empty() {
+                    r.rr.iter().map(|&v| v as f64).collect::<Vec<_>>()
+                } else if r.bpm > 0 {
+                    vec![60.0 / r.bpm as f64 * 1000.0]
+                } else {
+                    vec![]
+                }
+            })
+            .collect();
+
+        if rr_sequence.len() < 2 {
+            return None;
+        }
+
+        let waking_rmssd = Self::rmssd(&rr_sequence);
+
+        let score = match sleep_baseline_hrv {
+            Some(baseline) if baseline > 0.0 => {
+                // Ratio-based: waking RMSSD relative to sleep HRV baseline.
+                // ratio >= 1.0 → waking HRV at or above recovery level → score 0
+                // ratio << 1.0 → waking HRV well below baseline → score approaches 10
+                let ratio = waking_rmssd / baseline;
+                ((1.0 - ratio).max(0.0) * 10.0).min(10.0)
+            }
+            _ => {
+                // No baseline available: use absolute RMSSD scale.
+                // Typical waking RMSSD: ~10 ms (high stress) to ~100+ ms (very relaxed).
+                Self::absolute_score(waking_rmssd)
+            }
+        };
+
+        Some(StressScore {
+            time: latest_time,
+            score,
+            waking_rmssd,
+            baseline_hrv: sleep_baseline_hrv,
+        })
     }
-}
 
-#[derive(Debug)]
-struct StressCalcParams {
-    min: u16,
-    max: u16,
-    mode: u16,
-    mode_freq: u16,
-    count: u16,
-}
-
-impl StressCalcParams {
-    // Uses hr instead of rr measured by whoop, because whoop doesn't always measure rr
-    fn new(hr: Vec<u8>) -> Self {
-        let count = hr.len() as u16;
-        let rr_readings = hr
-            .into_iter()
-            .map(|bpm| (60.0 / f64::from(bpm) * 1000.0).round() as u16);
-
-        let mut counts = BTreeMap::new();
-
-        for num in rr_readings {
-            *counts.entry(num).or_insert(0_u16) += 1;
+    /// Root mean square of successive differences between consecutive RR intervals.
+    fn rmssd(rr: &[f64]) -> f64 {
+        if rr.len() < 2 {
+            return 0.0;
         }
-
-        let min = counts.keys().min().copied().unwrap_or_default();
-        let max = counts.keys().max().copied().unwrap_or_default();
-        let (mode, mode_freq) = counts
-            .into_iter()
-            .max_by(|(_ak, av), (_bk, bv)| av.cmp(bv))
-            .unwrap_or_default();
-
-        Self {
-            min,
-            max,
-            mode,
-            mode_freq,
-            count,
-        }
+        let sum_sq: f64 = rr.windows(2).map(|w| (w[1] - w[0]).powi(2)).sum();
+        (sum_sq / (rr.len() - 1) as f64).sqrt()
     }
 
-    fn stress_score(self) -> f64 {
-        let vr = f64::from(self.max - self.min) / 1000_f64;
-
-        if vr < 0.0001 {
-            return 0_f64;
-        }
-
-        let a_mode = f64::from(self.mode_freq) / f64::from(self.count) * 100_f64;
-        (a_mode / (2_f64 * vr * f64::from(self.mode) / 1000_f64))
-            .round()
-            .min(1000_f64)
-            / 100_f64
+    /// Map absolute RMSSD (ms) to a 0–10 stress scale when no sleep
+    /// baseline is available.  10 ms → score 10, ≥100 ms → score 0.
+    fn absolute_score(rmssd_ms: f64) -> f64 {
+        let normalized = ((rmssd_ms - 10.0) / 90.0).clamp(0.0, 1.0);
+        ((1.0 - normalized) * 10.0 * 100.0).round() / 100.0
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::stress::StressCalcParams;
+    use super::StressCalculator;
 
     #[test]
-    fn test_stress_calc() {
-        let hr = [
-            90, 89, 88, 87, 88, 92, 94, 95, 96, 97, 98, 97, 99, 101, 103, 104, 106, 107, 107, 108,
-            108, 109, 108, 108, 108, 108, 109, 109, 110, 111, 113, 113, 113, 113, 113, 112, 111,
-            110, 109, 108, 107, 106, 105, 104, 104, 103, 103, 103, 102, 101, 101, 100, 100, 100,
-            100, 101, 100, 98, 97, 96, 95, 95, 95, 96, 96, 97, 97, 97, 98, 99, 101, 100, 100, 100,
-            100, 99, 99, 99, 99, 100, 99, 98, 98, 98, 98, 98, 98, 98, 98, 97, 98, 98, 98, 97, 97,
-            96, 96, 96, 95, 94, 93, 93, 94, 94, 95, 96, 96, 96, 96, 95, 94, 95, 95, 96, 96, 96, 96,
-            96, 97, 98,
-        ];
-        dbg!(StressCalcParams::new(hr.to_vec()).stress_score());
+    fn test_rmssd_constant_series() {
+        // Constant RR → zero successive differences → RMSSD = 0
+        let rr = vec![800.0; 10];
+        assert_eq!(StressCalculator::rmssd(&rr), 0.0);
+    }
 
-        let hr = [
-            111, 112, 110, 111, 111, 113, 114, 116, 116, 116, 118, 117, 119, 118, 117, 117, 116,
-            115, 115, 115, 115, 115, 115, 115, 115, 114, 113, 112, 112, 111, 111, 110, 110, 111,
-            112, 114, 116, 116, 117, 117, 119, 121, 122, 123, 123, 124, 124, 123, 122, 120, 119,
-            118, 118, 118, 118, 118, 118, 118, 118, 118, 116, 114, 113, 111, 109, 108, 108, 110,
-            112, 114, 116, 118, 117, 116, 115, 113, 112, 112, 114, 116, 115, 115, 117, 119, 119,
-            120, 120, 119, 119, 119, 118, 117, 117, 116, 115, 115, 115, 115, 115, 116, 116, 116,
-            118, 120, 122, 123, 124, 124, 125, 125, 126, 126, 126, 126, 127, 127, 126, 125, 124,
-            123,
-        ];
-        dbg!(StressCalcParams::new(hr.to_vec()).stress_score());
+    #[test]
+    fn test_rmssd_alternating() {
+        // Alternating 800/900 → each diff = 100 → RMSSD = 100
+        let rr: Vec<f64> = (0..10).map(|i| if i % 2 == 0 { 800.0 } else { 900.0 }).collect();
+        let result = StressCalculator::rmssd(&rr);
+        assert!((result - 100.0).abs() < 0.001, "expected ~100, got {}", result);
+    }
 
-        let hr = [
-            60, 61, 59, 59, 59, 59, 59, 60, 60, 60, 60, 60, 61, 61, 61, 61, 61, 61, 61, 61, 63, 63,
-            63, 63, 64, 63, 63, 63, 62, 62, 62, 62, 61, 61, 61, 61, 62, 62, 62, 62, 62, 62, 62, 62,
-            62, 62, 62, 62, 62, 62, 62, 62, 62, 63, 63, 63, 63, 63, 63, 63, 64, 64, 64, 64, 64, 65,
-            65, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 65, 65, 65, 64, 64, 63, 63, 63, 63,
-            62, 62, 62, 61, 61, 61, 61, 62, 62, 62, 61, 61, 61, 61, 62, 62, 62, 62, 62, 63, 63, 63,
-            63, 64, 63, 63, 63, 62, 62, 63, 63, 63,
-        ];
-        dbg!(StressCalcParams::new(hr.to_vec()).stress_score());
-
-        let hr = [
-            50, 50, 50, 50, 51, 52, 54, 54, 54, 55, 56, 56, 57, 56, 56, 56, 56, 54, 52, 52, 51, 50,
-            49, 49, 49, 49, 48, 47, 46, 47, 47, 48, 49, 50, 52, 51, 51, 51, 52, 53, 53, 54, 54, 55,
-            55, 56, 54, 53, 52, 52, 53, 53, 50, 50, 50, 50, 50, 49, 49, 50, 49, 49, 49, 48, 48, 48,
-            48, 48, 47, 47, 48, 48, 50, 50, 50, 50, 52, 52, 53, 53, 54, 54, 54, 55, 56, 57, 58, 58,
-            58, 60, 59, 59, 58, 58, 59, 58, 58, 57, 58, 59, 58, 58, 57, 57, 58, 59, 59, 59, 58, 56,
-            55, 55, 54, 55, 55, 54, 55, 55, 55, 54,
-        ];
-        dbg!(StressCalcParams::new(hr.to_vec()).stress_score());
-
-        let hr = [
-            140, 141, 142, 143, 144, 142, 140, 137, 136, 135, 134, 133, 133, 132, 131, 131, 131,
-            130, 130, 129, 129, 127, 126, 125, 124, 124, 123, 122, 122, 121, 122, 122, 119, 119,
-            119, 119, 118, 120, 121, 121, 121, 119, 119, 118, 117, 117, 116, 115, 114, 114, 114,
-            114, 112, 111, 112, 111, 110, 108, 108, 107, 107, 108, 110, 110, 110, 111, 111, 112,
-            112, 112, 112, 112, 112, 112, 114, 114, 114, 115, 115, 114, 114, 114, 113, 113, 113,
-            113, 113, 112, 113, 115, 115, 116, 117, 116, 116, 117, 117, 118, 119, 119, 120, 119,
-            118, 117, 116, 115, 118, 117, 116, 117, 117, 115, 114, 113, 112, 113, 113, 113, 114,
-            114,
-        ];
-        dbg!(StressCalcParams::new(hr.to_vec()).stress_score());
+    #[test]
+    fn test_absolute_score_bounds() {
+        assert_eq!(StressCalculator::absolute_score(10.0), 10.0);  // floor
+        assert_eq!(StressCalculator::absolute_score(100.0), 0.0);  // ceiling
+        assert_eq!(StressCalculator::absolute_score(1000.0), 0.0); // clamped
     }
 }

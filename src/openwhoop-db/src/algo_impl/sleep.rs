@@ -27,6 +27,7 @@ fn map_sleep_cycle(value: sleep_cycles::Model) -> SleepCycle {
         min_hrv: value.min_hrv.try_into().unwrap(),
         max_hrv: value.max_hrv.try_into().unwrap(),
         avg_hrv: value.avg_hrv.try_into().unwrap(),
+        avg_resp_rate: 0.0, // not stored in SQLite; computed only in BigQuery path
         score: value
             .score
             .unwrap_or(SleepCycle::sleep_score(value.start, value.end)),

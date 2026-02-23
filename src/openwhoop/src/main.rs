@@ -259,8 +259,9 @@ async fn main() -> anyhow::Result<()> {
                     whoop::Activity::Sleep => {
                         let cycle = openwhoop_algos::SleepCycle::from_event(event, &all_readings);
                         info!(
-                            "Sleep cycle HRV: min={} avg={} max={} (readings in window: {})",
+                            "Sleep cycle HRV: min={} avg={} max={} | resp_rate={:.1} br/min (readings in window: {})",
                             cycle.min_hrv, cycle.avg_hrv, cycle.max_hrv,
+                            cycle.avg_resp_rate,
                             all_readings.iter().filter(|r| r.time >= event.start && r.time <= event.end).count()
                         );
                         sleeps.push(cycle);
@@ -280,19 +281,26 @@ async fn main() -> anyhow::Result<()> {
             let exercise_metrics = ExerciseMetrics::new(exercises.clone());
             println!("Exercise Metrics:\n{}", exercise_metrics);
 
-            // Calculate stress for only the last 12 hours
-            let twelve_hours_ago = chrono::Utc::now().naive_utc() - chrono::TimeDelta::hours(12);
-            let recent_readings: Vec<_> = all_readings
-                .iter()
-                .filter(|r| r.time >= twelve_hours_ago)
-                .cloned()
-                .collect();
+            // Extract the most recent sleep's avg HRV as the personal baseline.
+            // The stress calculator uses this to produce a ratio-based score
+            // (waking RMSSD relative to sleep recovery HRV) rather than an
+            // absolute value that varies widely between individuals.
+            let sleep_baseline_hrv: Option<f64> = sleeps
+                .last()
+                .map(|s| s.avg_hrv as f64)
+                .filter(|&v| v > 0.0);
 
-            let stress_score = openwhoop_algos::StressCalculator::calculate_stress(&recent_readings);
+            let stress_score = openwhoop_algos::StressCalculator::calculate_stress(
+                &all_readings,
+                sleep_baseline_hrv,
+            );
             if let Some(stress) = &stress_score {
-                println!("Calculated Stress Score: {}", stress.score);
+                info!(
+                    "Stress score: {:.2} | waking RMSSD: {:.1} ms | baseline HRV: {:?}",
+                    stress.score, stress.waking_rmssd, stress.baseline_hrv
+                );
             } else {
-                println!("Not enough recent data to calculate stress score");
+                info!("Not enough recent waking data to calculate stress score");
             }
 
             println!("Saving User Data to Firestore...");
@@ -596,37 +604,103 @@ async fn write_firestore_events(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to init Firestore client: {}", e))?;
 
-    let json_sleeps: Vec<_> = sleeps.iter().map(|sleep| serde_json::json!({
-        "sleep_id": sleep.start.and_utc().timestamp(),
-        "start": sleep.start.and_utc().timestamp(),
-        "end": sleep.end.and_utc().timestamp(),
-        "min_bpm": sleep.min_bpm,
-        "max_bpm": sleep.max_bpm,
-        "avg_bpm": sleep.avg_bpm as f64,
-        "min_hrv": sleep.min_hrv as f64,
-        "max_hrv": sleep.max_hrv as f64,
-        "avg_hrv": sleep.avg_hrv as f64,
-        "score": sleep.score,
-    })).collect();
+    // Build the new records from this run
+    let new_sleep_map: std::collections::HashMap<i64, serde_json::Value> = sleeps
+        .iter()
+        .map(|sleep| {
+            let id = sleep.start.and_utc().timestamp();
+            (id, serde_json::json!({
+                "sleep_id": id,
+                "start": id,
+                "end": sleep.end.and_utc().timestamp(),
+                "min_bpm": sleep.min_bpm,
+                "max_bpm": sleep.max_bpm,
+                "avg_bpm": sleep.avg_bpm as f64,
+                "min_hrv": sleep.min_hrv as f64,
+                "max_hrv": sleep.max_hrv as f64,
+                "avg_hrv": sleep.avg_hrv as f64,
+                "avg_resp_rate": sleep.avg_resp_rate,
+                "score": sleep.score,
+            }))
+        })
+        .collect();
 
-    let json_exercises: Vec<_> = exercises.iter().map(|exercise| serde_json::json!({
-        "period_id": exercise.start.and_utc().timestamp(),
-        "activity": exercise.activity as u8,
-        "start": exercise.start.and_utc().timestamp(),
-        "end": exercise.end.and_utc().timestamp(),
-    })).collect();
+    let new_exercise_map: std::collections::HashMap<i64, serde_json::Value> = exercises
+        .iter()
+        .map(|exercise| {
+            let id = exercise.start.and_utc().timestamp();
+            (id, serde_json::json!({
+                "period_id": id,
+                "activity": exercise.activity as u8,
+                "start": id,
+                "end": exercise.end.and_utc().timestamp(),
+            }))
+        })
+        .collect();
+
+    // Read the existing Firestore document so we can merge rather than replace.
+    // Sleeps and activities are append-only — once recorded they are never removed.
+    let existing: Option<serde_json::Value> = firestore_db
+        .fluent()
+        .select()
+        .by_id_in(&users_col)
+        .obj::<serde_json::Value>()
+        .one(user_id)
+        .await
+        .unwrap_or(None); // if doc doesn't exist yet, start fresh
+
+    // Merge sleep_cycles: existing records keyed by sleep_id win on conflict
+    // (we don't want to overwrite historical records with a partial re-run).
+    // New records from this run are added if not already present.
+    let mut sleep_map: std::collections::HashMap<i64, serde_json::Value> =
+        if let Some(serde_json::Value::Array(arr)) =
+            existing.as_ref().and_then(|d| d.get("sleep_cycles"))
+        {
+            arr.iter()
+                .filter_map(|v| v.get("sleep_id")?.as_i64().map(|id| (id, v.clone())))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+    for (id, record) in new_sleep_map {
+        sleep_map.entry(id).or_insert(record);
+    }
+    let mut merged_sleeps: Vec<serde_json::Value> = sleep_map.into_values().collect();
+    merged_sleeps.sort_by_key(|v| v.get("start").and_then(|s| s.as_i64()).unwrap_or(0));
+    info!("sleep_cycles after merge: {} total records", merged_sleeps.len());
+
+    // Merge activities the same way, keyed by period_id
+    let mut exercise_map: std::collections::HashMap<i64, serde_json::Value> =
+        if let Some(serde_json::Value::Array(arr)) =
+            existing.as_ref().and_then(|d| d.get("activities"))
+        {
+            arr.iter()
+                .filter_map(|v| v.get("period_id")?.as_i64().map(|id| (id, v.clone())))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+    for (id, record) in new_exercise_map {
+        exercise_map.entry(id).or_insert(record);
+    }
+    let mut merged_exercises: Vec<serde_json::Value> = exercise_map.into_values().collect();
+    merged_exercises.sort_by_key(|v| v.get("start").and_then(|s| s.as_i64()).unwrap_or(0));
+    info!("activities after merge: {} total records", merged_exercises.len());
 
     let mut doc = serde_json::json!({
         "lastProcessedReading": last_processed.and_utc().timestamp(),
-        "sleep_cycles": json_sleeps,
-        "activities": json_exercises,
+        "sleep_cycles": merged_sleeps,
+        "activities": merged_exercises,
     });
+
 
     if let Some(stress) = stress_score {
         if let Some(obj) = doc.as_object_mut() {
             obj.insert("stress_score".to_string(), serde_json::json!({
                 "time": stress.time.and_utc().timestamp(),
-                "score": stress.score as f64,
+                "score": stress.score,
+                "waking_rmssd_ms": stress.waking_rmssd,
+                "baseline_hrv_ms": stress.baseline_hrv,
             }));
         }
     }
@@ -638,6 +712,7 @@ async fn write_firestore_events(
                 "min_hrv": latest_sleep.min_hrv as f64,
                 "max_hrv": latest_sleep.max_hrv as f64,
                 "avg_hrv": latest_sleep.avg_hrv as f64,
+                "avg_resp_rate": latest_sleep.avg_resp_rate,
                 "sleep_start": latest_sleep.start.and_utc().timestamp(),
                 "sleep_end": latest_sleep.end.and_utc().timestamp(),
             }));
