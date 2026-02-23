@@ -305,7 +305,7 @@ async fn main() -> anyhow::Result<()> {
 
             println!("Saving User Data to Firestore...");
             let last_processed = all_readings.last().map(|r| r.time).unwrap_or_default();
-            write_firestore_events(&user_id, &sleeps, &exercises, stress_score, last_processed).await?;
+            write_firestore_events(&user_id, &all_readings, &sleeps, &exercises, stress_score, last_processed).await?;
             println!("Successfully processed user {}", user_id);
 
             return Ok(());
@@ -591,6 +591,7 @@ async fn fetch_user_history(user_id: &str, hours: u32) -> anyhow::Result<Vec<who
 
 async fn write_firestore_events(
     user_id: &str,
+    all_readings: &[whoop::ParsedHistoryReading],
     sleeps: &[openwhoop_algos::SleepCycle],
     exercises: &[openwhoop_algos::ActivityPeriod],
     stress_score: Option<openwhoop_algos::StressScore>,
@@ -604,11 +605,12 @@ async fn write_firestore_events(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to init Firestore client: {}", e))?;
 
-    // Build the new records from this run
+    // Build the new records from this run (with per-minute HR graph data)
     let new_sleep_map: std::collections::HashMap<i64, serde_json::Value> = sleeps
         .iter()
         .map(|sleep| {
             let id = sleep.start.and_utc().timestamp();
+            let hr_by_minute = aggregate_hr_by_minute(all_readings, sleep.start, sleep.end);
             (id, serde_json::json!({
                 "sleep_id": id,
                 "start": id,
@@ -621,6 +623,7 @@ async fn write_firestore_events(
                 "avg_hrv": sleep.avg_hrv as f64,
                 "avg_resp_rate": sleep.avg_resp_rate,
                 "score": sleep.score,
+                "hr_by_minute": hr_by_minute,
             }))
         })
         .collect();
@@ -629,11 +632,13 @@ async fn write_firestore_events(
         .iter()
         .map(|exercise| {
             let id = exercise.start.and_utc().timestamp();
+            let hr_by_minute = aggregate_hr_by_minute(all_readings, exercise.start, exercise.end);
             (id, serde_json::json!({
                 "period_id": id,
                 "activity": exercise.activity as u8,
                 "start": id,
                 "end": exercise.end.and_utc().timestamp(),
+                "hr_by_minute": hr_by_minute,
             }))
         })
         .collect();
@@ -649,9 +654,8 @@ async fn write_firestore_events(
         .await
         .unwrap_or(None); // if doc doesn't exist yet, start fresh
 
-    // Merge sleep_cycles: existing records keyed by sleep_id win on conflict
-    // (we don't want to overwrite historical records with a partial re-run).
-    // New records from this run are added if not already present.
+    // Merge sleep_cycles: existing identity fields win; hr_by_minute is always
+    // refreshed from the current run so graphs improve as data quality improves.
     let mut sleep_map: std::collections::HashMap<i64, serde_json::Value> =
         if let Some(serde_json::Value::Array(arr)) =
             existing.as_ref().and_then(|d| d.get("sleep_cycles"))
@@ -662,8 +666,12 @@ async fn write_firestore_events(
         } else {
             std::collections::HashMap::new()
         };
-    for (id, record) in new_sleep_map {
-        sleep_map.entry(id).or_insert(record);
+    for (id, new_record) in new_sleep_map {
+        let entry = sleep_map.entry(id).or_insert_with(|| new_record.clone());
+        // Always update hr_by_minute — it improves with better/more data
+        if let Some(hr) = new_record.get("hr_by_minute") {
+            entry.as_object_mut().map(|o| o.insert("hr_by_minute".to_string(), hr.clone()));
+        }
     }
     let mut merged_sleeps: Vec<serde_json::Value> = sleep_map.into_values().collect();
     merged_sleeps.sort_by_key(|v| v.get("start").and_then(|s| s.as_i64()).unwrap_or(0));
@@ -680,8 +688,12 @@ async fn write_firestore_events(
         } else {
             std::collections::HashMap::new()
         };
-    for (id, record) in new_exercise_map {
-        exercise_map.entry(id).or_insert(record);
+    for (id, new_record) in new_exercise_map {
+        let entry = exercise_map.entry(id).or_insert_with(|| new_record.clone());
+        // Always update hr_by_minute — it improves as data quality improves
+        if let Some(hr) = new_record.get("hr_by_minute") {
+            entry.as_object_mut().map(|o| o.insert("hr_by_minute".to_string(), hr.clone()));
+        }
     }
     let mut merged_exercises: Vec<serde_json::Value> = exercise_map.into_values().collect();
     merged_exercises.sort_by_key(|v| v.get("start").and_then(|s| s.as_i64()).unwrap_or(0));
@@ -913,4 +925,48 @@ impl OpenWhoopCli {
             .next()
             .ok_or(anyhow!("No BLE adapters found"))
     }
+}
+
+/// Aggregate heart rate readings within [start, end] into per-minute buckets.
+///
+/// Returns a chronologically sorted array of objects:
+/// `{ "t": <unix_seconds at minute boundary>, "min": u8, "max": u8, "avg": f64 }`
+///
+/// Zero-BPM readings (band off) are excluded.  The "t" value is the Unix
+/// timestamp of the start of each 60-second window (floor to minute).
+fn aggregate_hr_by_minute(
+    readings: &[whoop::ParsedHistoryReading],
+    start: chrono::NaiveDateTime,
+    end: chrono::NaiveDateTime,
+) -> Vec<serde_json::Value> {
+    use std::collections::BTreeMap;
+
+    // (minute_unix → (min_bpm, max_bpm, sum, count))
+    let mut by_minute: BTreeMap<i64, (u8, u8, u32, u32)> = BTreeMap::new();
+
+    for r in readings
+        .iter()
+        .filter(|r| r.time >= start && r.time <= end && r.bpm > 0)
+    {
+        let minute = r.time.and_utc().timestamp() / 60 * 60;
+        let entry = by_minute
+            .entry(minute)
+            .or_insert((r.bpm, r.bpm, 0, 0));
+        entry.0 = entry.0.min(r.bpm);
+        entry.1 = entry.1.max(r.bpm);
+        entry.2 += r.bpm as u32;
+        entry.3 += 1;
+    }
+
+    by_minute
+        .into_iter()
+        .map(|(minute, (min_bpm, max_bpm, sum, count))| {
+            serde_json::json!({
+                "t":   minute,
+                "min": min_bpm,
+                "max": max_bpm,
+                "avg": (sum as f64 / count as f64 * 10.0).round() / 10.0,
+            })
+        })
+        .collect()
 }
