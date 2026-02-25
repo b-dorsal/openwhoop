@@ -36,6 +36,24 @@ DATABASE_URL = os.getenv("DATABASE_URL").replace("sqlite://", PREFIX)
 df = pd.read_sql(QUERY, DATABASE_URL)
 ```
 
+### Processing Data Locally
+
+To test the data processing logic locally for a specific user, you can run the `process-user` CLI command with the necessary BigQuery environment variables overriding the defaults. Replace the user ID string with the target user's ID:
+
+```sh
+export GOOGLE_CLOUD_PROJECT=openwhoops
+export BIGQUERY_DATASET=openwhoop_analytics
+export LOOKBACK_HOURS=36
+export RUST_LOG=info
+
+cargo run --bin openwhoop --release -- process-user "klEddRd1tqNHQV8gkC5mOR6X18O2"
+```
+
+Or as a single line:
+
+```sh
+GOOGLE_CLOUD_PROJECT=openwhoops BIGQUERY_DATASET=openwhoop_analytics LOOKBACK_HOURS=36 RUST_LOG=info cargo run --release --bin openwhoop -- process-user "klEddRd1tqNHQV8gkC5mOR6X18O2"
+```
 
 ## TODO:
 

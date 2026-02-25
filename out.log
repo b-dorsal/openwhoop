@@ -1,0 +1,49 @@
+warning: unused imports: `Arc`, `AtomicBool`, `Ordering`, and `io`
+ --> src/openwhoop/src/main.rs:5:5
+  |
+5 |     io,
+  |     ^^
+...
+8 |         Arc,
+  |         ^^^
+9 |         atomic::{AtomicBool, Ordering},
+  |                  ^^^^^^^^^^  ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `BDAddr`
+  --> src/openwhoop/src/main.rs:16:11
+   |
+16 |     api::{BDAddr, Central, Manager as _, Peripheral as _, ScanFilter},
+   |           ^^^^^^
+
+warning: unused import: `generate`
+  --> src/openwhoop/src/main.rs:21:28
+   |
+21 | use clap_complete::{Shell, generate};
+   |                            ^^^^^^^^
+
+warning: unused imports: `ActivityType`, `OpenWhoop`, and `SearchActivityPeriods`
+  --> src/openwhoop/src/main.rs:25:5
+   |
+25 |     OpenWhoop, WhoopDevice,
+   |     ^^^^^^^^^
+...
+28 |     types::activities::{ActivityType, SearchActivityPeriods},
+   |                         ^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `adapter_from_name` is never used
+   --> src/openwhoop/src/main.rs:947:14
+    |
+933 | impl OpenWhoopCli {
+    | ----------------- associated function in this implementation
+...
+947 |     async fn adapter_from_name(manager: &Manager, interface: &str) -> anyhow::Result<Adapter> {
+    |              ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: `openwhoop` (bin "openwhoop") generated 5 warnings (run `cargo fix --bin "openwhoop"` to apply 4 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.48s
+     Running `target/release/openwhoop process-user klEddRd1tqNHQV8gkC5mOR6X18O2`
+[2026-02-25T02:18:13Z INFO  openwhoop] Processing data for user klEddRd1tqNHQV8gkC5mOR6X18O2 with lookback of 350 hours

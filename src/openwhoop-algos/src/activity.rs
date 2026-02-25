@@ -26,7 +26,7 @@ impl ActivityPeriod {
         Self::smooth_spikes(history);
         let changes = Self::detect_changes(history);
 
-        Self::filter_merge(changes)
+        let mut periods: Vec<ActivityPeriod> = Self::filter_merge(changes)
             .into_iter()
             .map(|a| ActivityPeriod {
                 activity: a.activity,
@@ -34,7 +34,52 @@ impl ActivityPeriod {
                 end: a.end,
                 duration: a.end - a.start,
             })
-            .collect()
+            .collect();
+
+        // **V2 Heuristic**: Reclassify based on heart rate
+        for period in &mut periods {
+            if matches!(period.activity, Activity::Active) && period.duration > MIN_SLEEP_DURATION {
+                let hr_in_range: Vec<u8> = history
+                    .iter()
+                    .filter(|h| h.time >= period.start && h.time <= period.end)
+                    .map(|h| h.bpm)
+                    .collect();
+
+                if !hr_in_range.is_empty() {
+                    let avg_bpm = hr_in_range.iter().map(|&b| b as u64).sum::<u64>() / hr_in_range.len() as u64;
+                    if avg_bpm < 70 {
+                        period.activity = Activity::Sleep;
+                    }
+                }
+            } else if matches!(period.activity, Activity::Sleep) {
+                let hr_in_range: Vec<u8> = history
+                    .iter()
+                    .filter(|h| h.time >= period.start && h.time <= period.end)
+                    .map(|h| h.bpm)
+                    .collect();
+
+                if !hr_in_range.is_empty() {
+                    let avg_bpm = hr_in_range.iter().map(|&b| b as u64).sum::<u64>() / hr_in_range.len() as u64;
+                    if avg_bpm > 85 {
+                        period.activity = Activity::Active;
+                    }
+                }
+            }
+        }
+        
+        let mut final_periods: Vec<ActivityPeriod> = Vec::new();
+        for p in periods {
+            if let Some(last) = final_periods.last_mut() {
+                if last.activity == p.activity && ((p.start - last.end) < MAX_SLEEP_PAUSE) {
+                    last.end = p.end;
+                    last.duration = last.end - last.start;
+                    continue;
+                }
+            }
+            final_periods.push(p);
+        }
+
+        final_periods
     }
 
     pub fn is_active(&self) -> bool {

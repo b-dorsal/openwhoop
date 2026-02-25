@@ -257,6 +257,11 @@ async fn main() -> anyhow::Result<()> {
                 info!("EVENT: {:?} {} → {}", event.activity, event.start, event.end);
                 match event.activity {
                     whoop::Activity::Sleep => {
+                        if event.duration.num_minutes() < 60 {
+                            info!("Discarding sleep cycle shorter than 1 hour ({} mins)", event.duration.num_minutes());
+                            continue;
+                        }
+                        
                         let cycle = openwhoop_algos::SleepCycle::from_event(event, &all_readings);
                         info!(
                             "Sleep cycle HRV: min={} avg={} max={} | resp_rate={:.1} br/min (readings in window: {})",
@@ -408,7 +413,7 @@ async fn fetch_user_history(user_id: &str, hours: u32) -> anyhow::Result<Vec<who
         "SELECT unix, bpm, rr, activity 
          FROM `{project_id}.{dataset_id}.heart_rate` 
          WHERE uid = '{user_id}' AND unix >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {hours} HOUR)
-         ORDER BY unix ASC"
+         ORDER BY unix ASC, activity DESC"
     );
 
     let mut query_request = gcp_bigquery_client::model::query_request::QueryRequest::new(query);
@@ -667,8 +672,26 @@ async fn write_firestore_events(
             std::collections::HashMap::new()
         };
     for (id, new_record) in new_sleep_map {
+        let new_start = new_record["start"].as_i64().unwrap_or(0);
+        let new_end = new_record["end"].as_i64().unwrap_or(0);
+
+        let mut overlapping = Vec::new();
+        for (ext_id, ext_record) in &sleep_map {
+            let ext_start = ext_record["start"].as_i64().unwrap_or(0);
+            let ext_end = ext_record["end"].as_i64().unwrap_or(0);
+            
+            let overlap_start = new_start.max(ext_start);
+            let overlap_end = new_end.min(ext_end);
+
+            if overlap_start < overlap_end && (overlap_end - overlap_start > 1800) {
+                overlapping.push(*ext_id);
+            }
+        }
+        for old_id in overlapping {
+            sleep_map.remove(&old_id);
+        }
+
         let entry = sleep_map.entry(id).or_insert_with(|| new_record.clone());
-        // Always update hr_by_minute — it improves with better/more data
         if let Some(hr) = new_record.get("hr_by_minute") {
             entry.as_object_mut().map(|o| o.insert("hr_by_minute".to_string(), hr.clone()));
         }
@@ -677,7 +700,6 @@ async fn write_firestore_events(
     merged_sleeps.sort_by_key(|v| v.get("start").and_then(|s| s.as_i64()).unwrap_or(0));
     info!("sleep_cycles after merge: {} total records", merged_sleeps.len());
 
-    // Merge activities the same way, keyed by period_id
     let mut exercise_map: std::collections::HashMap<i64, serde_json::Value> =
         if let Some(serde_json::Value::Array(arr)) =
             existing.as_ref().and_then(|d| d.get("activities"))
@@ -689,8 +711,26 @@ async fn write_firestore_events(
             std::collections::HashMap::new()
         };
     for (id, new_record) in new_exercise_map {
+        let new_start = new_record["start"].as_i64().unwrap_or(0);
+        let new_end = new_record["end"].as_i64().unwrap_or(0);
+
+        let mut overlapping = Vec::new();
+        for (ext_id, ext_record) in &exercise_map {
+            let ext_start = ext_record["start"].as_i64().unwrap_or(0);
+            let ext_end = ext_record["end"].as_i64().unwrap_or(0);
+            
+            let overlap_start = new_start.max(ext_start);
+            let overlap_end = new_end.min(ext_end);
+
+            if overlap_start < overlap_end && (overlap_end - overlap_start > 900) {
+                overlapping.push(*ext_id);
+            }
+        }
+        for old_id in overlapping {
+            exercise_map.remove(&old_id);
+        }
+
         let entry = exercise_map.entry(id).or_insert_with(|| new_record.clone());
-        // Always update hr_by_minute — it improves as data quality improves
         if let Some(hr) = new_record.get("hr_by_minute") {
             entry.as_object_mut().map(|o| o.insert("hr_by_minute".to_string(), hr.clone()));
         }

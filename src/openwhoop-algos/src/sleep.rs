@@ -183,10 +183,10 @@ impl SleepCycle {
     }
 
     pub fn sleep_score(start: NaiveDateTime, end: NaiveDateTime) -> f64 {
-        let duration = (end - start).num_seconds();
-        const IDEAL_DURATION: i64 = 60 * 60 * 8;
+        let duration = (end - start).num_seconds() as f64;
+        const IDEAL_DURATION: f64 = (60 * 60 * 8) as f64;
 
-        let score = (duration / IDEAL_DURATION) as f64;
+        let score = duration / IDEAL_DURATION;
 
         (score * 100.0).clamp(0.0, 100.0)
     }
