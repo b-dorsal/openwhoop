@@ -109,8 +109,29 @@ async fn main() -> anyhow::Result<()> {
                 .parse::<u32>()
                 .unwrap_or(168);
 
-            info!("Processing data for user {} with lookback of {} hours", user_id, lookback_hours);
-            let mut all_readings = fetch_user_history(&user_id, lookback_hours).await?;
+            let project_id = std::env::var("GOOGLE_CLOUD_PROJECT").unwrap_or_else(|_| "your-project-id".to_string());
+            let users_col = std::env::var("FIRESTORE_COLLECTION_USERS").unwrap_or_else(|_| "user-data".to_string());
+            let firestore_db = firestore::FirestoreDb::new(&project_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to init Firestore client: {}", e))?;
+
+            let existing_doc: Option<serde_json::Value> = firestore_db
+                .fluent()
+                .select()
+                .by_id_in(&users_col)
+                .obj::<serde_json::Value>()
+                .one(&user_id)
+                .await
+                .unwrap_or(None);
+
+            let last_event_end = existing_doc.as_ref()
+                .and_then(|doc| doc.get("lastProcessedReading"))
+                .and_then(|t| t.as_i64())
+                .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+                .map(|dt| dt.naive_utc());
+
+            info!("Processing data for user {} with lookback of {} hours. Last event end: {:?}", user_id, lookback_hours, last_event_end);
+            let mut all_readings = fetch_user_history(&user_id, lookback_hours, last_event_end).await?;
 
             // ── Deduplication ─────────────────────────────────────────────────────
             // BigQuery has no UNIQUE constraint on the timestamp column (unlike the
@@ -310,7 +331,7 @@ async fn main() -> anyhow::Result<()> {
 
             println!("Saving User Data to Firestore...");
             let last_processed = all_readings.last().map(|r| r.time).unwrap_or_default();
-            write_firestore_events(&user_id, &all_readings, &sleeps, &exercises, stress_score, last_processed).await?;
+            write_firestore_events(&user_id, &all_readings, &sleeps, &exercises, stress_score, last_processed, &firestore_db, existing_doc).await?;
             println!("Successfully processed user {}", user_id);
 
             return Ok(());
@@ -401,7 +422,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn fetch_user_history(user_id: &str, hours: u32) -> anyhow::Result<Vec<whoop::ParsedHistoryReading>> {
+async fn fetch_user_history(user_id: &str, hours: u32, last_event_end: Option<chrono::NaiveDateTime>) -> anyhow::Result<Vec<whoop::ParsedHistoryReading>> {
     let project_id = std::env::var("GOOGLE_CLOUD_PROJECT").unwrap_or_else(|_| "your-project-id".to_string());
     let dataset_id = std::env::var("BIGQUERY_DATASET").unwrap_or_else(|_| "whoop_data".to_string());
 
@@ -409,12 +430,25 @@ async fn fetch_user_history(user_id: &str, hours: u32) -> anyhow::Result<Vec<who
         .await
         .map_err(|e| anyhow::anyhow!("Failed to init BigQuery client: {}", e))?;
 
-    let query = format!(
-        "SELECT unix, bpm, rr, activity 
-         FROM `{project_id}.{dataset_id}.heart_rate` 
-         WHERE uid = '{user_id}' AND unix >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {hours} HOUR)
-         ORDER BY unix ASC, activity DESC"
-    );
+    let query = match last_event_end {
+        Some(ts) => {
+            let ts_str = ts.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            format!(
+                "SELECT unix, bpm, rr, activity 
+                 FROM `{project_id}.{dataset_id}.heart_rate` 
+                 WHERE uid = '{user_id}' AND unix >= GREATEST(TIMESTAMP('{ts_str}'), TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {hours} HOUR))
+                 ORDER BY unix ASC, activity DESC"
+            )
+        },
+        None => {
+            format!(
+                "SELECT unix, bpm, rr, activity 
+                 FROM `{project_id}.{dataset_id}.heart_rate` 
+                 WHERE uid = '{user_id}' AND unix >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {hours} HOUR)
+                 ORDER BY unix ASC, activity DESC"
+            )
+        }
+    };
 
     let mut query_request = gcp_bigquery_client::model::query_request::QueryRequest::new(query);
     query_request.use_legacy_sql = false;
@@ -601,14 +635,10 @@ async fn write_firestore_events(
     exercises: &[openwhoop_algos::ActivityPeriod],
     stress_score: Option<openwhoop_algos::StressScore>,
     last_processed: chrono::NaiveDateTime,
-
+    firestore_db: &firestore::FirestoreDb,
+    existing: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
-    let project_id = std::env::var("GOOGLE_CLOUD_PROJECT").unwrap_or_else(|_| "your-project-id".to_string());
     let users_col = std::env::var("FIRESTORE_COLLECTION_USERS").unwrap_or_else(|_| "user-data".to_string());
-
-    let firestore_db = firestore::FirestoreDb::new(&project_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to init Firestore client: {}", e))?;
 
     // Build the new records from this run (with per-minute HR graph data)
     let new_sleep_map: std::collections::HashMap<i64, serde_json::Value> = sleeps
@@ -650,14 +680,6 @@ async fn write_firestore_events(
 
     // Read the existing Firestore document so we can merge rather than replace.
     // Sleeps and activities are append-only — once recorded they are never removed.
-    let existing: Option<serde_json::Value> = firestore_db
-        .fluent()
-        .select()
-        .by_id_in(&users_col)
-        .obj::<serde_json::Value>()
-        .one(user_id)
-        .await
-        .unwrap_or(None); // if doc doesn't exist yet, start fresh
 
     // Merge sleep_cycles: existing identity fields win; hr_by_minute is always
     // refreshed from the current run so graphs improve as data quality improves.
@@ -739,8 +761,26 @@ async fn write_firestore_events(
     merged_exercises.sort_by_key(|v| v.get("start").and_then(|s| s.as_i64()).unwrap_or(0));
     info!("activities after merge: {} total records", merged_exercises.len());
 
+    let max_sleep_end = sleeps.iter().map(|s| s.end).max();
+    let max_exercise_end = exercises.iter().map(|e| e.end).max();
+    let new_event_end = match (max_sleep_end, max_exercise_end) {
+        (Some(s), Some(e)) => Some(s.max(e)),
+        (Some(s), None) => Some(s),
+        (None, Some(e)) => Some(e),
+        (None, None) => None,
+    };
+
+    let existing_last_processed = existing.as_ref()
+        .and_then(|doc| doc.get("lastProcessedReading"))
+        .and_then(|t| t.as_i64());
+
+    let processed_ts = new_event_end
+        .map(|ts| ts.and_utc().timestamp())
+        .or(existing_last_processed)
+        .unwrap_or_else(|| last_processed.and_utc().timestamp());
+
     let mut doc = serde_json::json!({
-        "lastProcessedReading": last_processed.and_utc().timestamp(),
+        "lastProcessedReading": processed_ts,
         "sleep_cycles": merged_sleeps,
         "activities": merged_exercises,
     });
