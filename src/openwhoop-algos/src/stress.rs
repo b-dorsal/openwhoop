@@ -63,21 +63,14 @@ impl StressCalculator {
             return None;
         }
 
-        // Build an RR sequence.  For readings that have actual device RR
-        // intervals, use them directly (multiple per reading is fine —
-        // they're individual beat-to-beat intervals).  For readings without
-        // RR data, synthesize one interval from BPM.
+        // Build an RR sequence. We MUST solely use actual device RR intervals.
+        // Synthesizing RR intervals from BPM aggregates (which are typically spaced
+        // minutes apart) treats large minute-to-minute fluctuations as successive
+        // beat-to-beat cardiac variance, which artificially inflates the RMSSD
+        // to absurd levels (e.g., >150ms).
         let rr_sequence: Vec<f64> = waking_readings
             .iter()
-            .flat_map(|r| {
-                if !r.rr.is_empty() {
-                    r.rr.iter().map(|&v| v as f64).collect::<Vec<_>>()
-                } else if r.bpm > 0 {
-                    vec![60.0 / r.bpm as f64 * 1000.0]
-                } else {
-                    vec![]
-                }
-            })
+            .flat_map(|r| r.rr.iter().map(|&v| v as f64))
             .collect();
 
         if rr_sequence.len() < 2 {

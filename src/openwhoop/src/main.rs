@@ -665,16 +665,49 @@ async fn write_firestore_events(
 
     let new_exercise_map: std::collections::HashMap<i64, serde_json::Value> = exercises
         .iter()
-        .map(|exercise| {
+        .filter_map(|exercise| {
             let id = exercise.start.and_utc().timestamp();
-            let hr_by_minute = aggregate_hr_by_minute(all_readings, exercise.start, exercise.end);
-            (id, serde_json::json!({
-                "period_id": id,
-                "activity": exercise.activity as u8,
-                "start": id,
-                "end": exercise.end.and_utc().timestamp(),
-                "hr_by_minute": hr_by_minute,
-            }))
+            let mut hr_by_minute = aggregate_hr_by_minute(all_readings, exercise.start, exercise.end);
+            
+            let mut time_in_zones = 0;
+            for minute_data in &mut hr_by_minute {
+                if let Some(obj) = minute_data.as_object_mut() {
+                    let avg = obj.get("avg").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let pct = avg / 190.0;
+                    
+                    let zone = if pct >= 0.9 {
+                        5
+                    } else if pct >= 0.8 {
+                        4
+                    } else if pct >= 0.7 {
+                        3
+                    } else if pct >= 0.6 {
+                        2
+                    } else if pct >= 0.5 {
+                        1
+                    } else {
+                        0
+                    };
+                    
+                    if zone > 0 {
+                        time_in_zones += 1;
+                    }
+                    
+                    obj.insert("hr_zone".to_string(), serde_json::json!(zone));
+                }
+            }
+
+            if time_in_zones < 5 {
+                None
+            } else {
+                Some((id, serde_json::json!({
+                    "period_id": id,
+                    "activity": exercise.activity as u8,
+                    "start": id,
+                    "end": exercise.end.and_utc().timestamp(),
+                    "hr_by_minute": hr_by_minute,
+                })))
+            }
         })
         .collect();
 
